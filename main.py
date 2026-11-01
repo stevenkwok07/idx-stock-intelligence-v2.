@@ -1,5 +1,7 @@
 import os
 import logging
+import json
+from pathlib import Path
 import threading
 import time
 from datetime import datetime, timezone
@@ -32,9 +34,28 @@ MIN_AVG_VALUE_IDR = float(os.getenv("MIN_AVG_VALUE_IDR", "1000000000"))
 # IDX public disclosure portal is exposed as a source/reference, not scraped as an undocumented API.
 IDX_DISCLOSURE_URL = "https://www.idx.co.id/id/perusahaan-tercatat/keterbukaan-informasi/"
 
+# Optional manually verified bank ratios. No values are bundled by default.
+# Format is documented in bank_metrics.example.json. Missing fields stay null.
+BANK_METRICS_FILE = Path(os.getenv("BANK_METRICS_FILE", "bank_metrics.json"))
+
+def load_manual_bank_metrics(ticker: str) -> dict:
+    try:
+        if not BANK_METRICS_FILE.exists():
+            return {}
+        payload = json.loads(BANK_METRICS_FILE.read_text(encoding="utf-8"))
+        item = payload.get(ticker.replace(".JK", ""), {})
+        return item if isinstance(item, dict) else {}
+    except Exception as exc:
+        log.warning("Cannot read manual bank metrics: %s", exc)
+        return {}
+
+def valid_percent(value, low=0, high=100):
+    number = safe_float(value)
+    return number if number is not None and low <= number <= high else None
+
 app = FastAPI(
     title="IDX Stock Intelligence API",
-    version="3.0.0",
+    version="4.0.0",
     description="IDX screener with technical momentum and sector-specific, coverage-aware fundamental analysis.",
 )
 
@@ -374,6 +395,30 @@ def analyze_fundamental(ticker: str) -> dict:
     ldr = _ratio_percent(_first_info(info, ["loanToDepositRatio", "loanToDeposit", "ldr"]))
     casa = _ratio_percent(_first_info(info, ["casaRatio", "casa"]))
 
+    # V4: optional overrides transcribed from official bank reports.
+    # These are never guessed or auto-filled. Provenance is returned to the API client.
+    manual = load_manual_bank_metrics(ticker) if is_bank else {}
+    manual_metrics = manual.get("metrics", {}) if isinstance(manual.get("metrics", {}), dict) else {}
+    metric_sources = {}
+    for field, bounds in {
+        "nim": (0, 100), "npl_gross": (0, 100), "npl_net": (0, 100),
+        "car": (0, 100), "ldr": (0, 200), "casa": (0, 100),
+    }.items():
+        candidate = valid_percent(manual_metrics.get(field), *bounds)
+        if candidate is not None:
+            if field == "nim": nim = candidate
+            elif field == "npl_gross": npl_gross = candidate
+            elif field == "npl_net": npl_net = candidate
+            elif field == "car": car = candidate
+            elif field == "ldr": ldr = candidate
+            elif field == "casa": casa = candidate
+            metric_sources[field] = {
+                "source": manual.get("source", "Manual entry; verify before use"),
+                "reporting_period": manual.get("reporting_period"),
+                "source_url": manual.get("source_url"),
+                "method": "manual_official_report_override"
+            }
+
     operating_margin = _ratio_percent(_first_info(info, ["operatingMargins"]))
     debt_equity = _first_info(info, ["debtToEquity"])
     if debt_equity is not None and abs(debt_equity) > 10:
@@ -388,7 +433,7 @@ def analyze_fundamental(ticker: str) -> dict:
     if trailing_pe is None and current_price and eps and eps > 0:
         trailing_pe = current_price / eps
 
-    # V3 uses a coverage-aware score: missing data is excluded from the denominator,
+    # V4 uses a coverage-aware score: missing data is excluded from the denominator,
     # and a separate coverage percentage tells users how much evidence is available.
     positives, risks, missing = [], [], []
     criteria = []
@@ -517,6 +562,16 @@ def analyze_fundamental(ticker: str) -> dict:
             "operating_cash_flow": [x[0] for x in cfo_s], "free_cash_flow": [x[0] for x in fcf_s],
         },
         "scoring_method": "Coverage-aware sector-specific rule scoring; missing metrics are excluded from score denominator and reported separately.",
+        "bank_metric_provenance": metric_sources if is_bank else {},
+        "bank_report_period": manual.get("reporting_period") if is_bank else None,
+        "bank_report_source_url": manual.get("source_url") if is_bank else None,
+        "manual_bank_metrics_loaded": bool(metric_sources) if is_bank else False,
+        "data_quality_warnings": (
+            ["Rasio bank dari input manual; cocokkan periode, definisi, dan angka dengan laporan resmi."]
+            if metric_sources else
+            (["Rasio NIM/NPL/CAR/LDR/CASA belum tersedia dari sumber data otomatis. Jangan menafsirkannya sebagai nol."]
+             if is_bank else [])
+        ),
         "data_sources": [
             {"name": "Yahoo Finance/yfinance", "type": "market_and_financial_data"},
             {"name": "IDX disclosure portal", "url": IDX_DISCLOSURE_URL, "type": "official_cross_check_reference"},
@@ -526,21 +581,41 @@ def analyze_fundamental(ticker: str) -> dict:
     }
 
 
+@app.get("/api/data-quality/{code}")
+def data_quality(code: str):
+    ticker = normalize_code(code)
+    is_bank = ticker in BANK_TICKERS
+    manual = load_manual_bank_metrics(ticker) if is_bank else {}
+    metrics = manual.get("metrics", {}) if isinstance(manual.get("metrics", {}), dict) else {}
+    expected = ["nim", "npl_gross", "npl_net", "car", "ldr", "casa"] if is_bank else []
+    supplied = [key for key in expected if valid_percent(metrics.get(key), 0, 200) is not None]
+    return {
+        "ticker": ticker,
+        "sector_engine": "BANKING" if is_bank else "NON_BANKING",
+        "manual_bank_metrics_configured": bool(supplied),
+        "manual_metrics_present": supplied,
+        "manual_metrics_missing": [key for key in expected if key not in supplied],
+        "reporting_period": manual.get("reporting_period"),
+        "source": manual.get("source"),
+        "source_url": manual.get("source_url"),
+        "warning": "Manual values are not independently verified by this API. Check the cited official report."
+    }
+
 @app.get("/")
 def root():
     return {
-        "name": "IDX Stock Intelligence API", "version": "3.0.0", "status": "ok", "docs": "/docs",
+        "name": "IDX Stock Intelligence API", "version": "4.0.0", "status": "ok", "docs": "/docs",
         "endpoints": [
             "/api/health", "/api/universe", "/api/scan", "/api/trend",
             "/api/short-term", "/api/long-term", "/api/stock/BBCA",
-            "/api/stock/BBCA/fundamental", "/api/cache/clear",
+            "/api/stock/BBCA/fundamental", "/api/data-quality/BBCA", "/api/cache/clear",
         ],
     }
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "idx-stock-intelligence", "version": "3.0.0"}
+    return {"status": "ok", "service": "idx-stock-intelligence", "version": "4.0.0"}
 
 
 @app.get("/api/universe")

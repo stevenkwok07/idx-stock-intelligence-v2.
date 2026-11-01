@@ -1,31 +1,49 @@
-# IDX Stock Intelligence API V3
-
-FastAPI backend for IDX technical screening and sector-aware fundamental screening.
-
-## V3 changes
-- Separates BANKING and NON_BANKING fundamental engines.
-- Bank scoring focuses on ROE, ROA, NIM, NPL gross, CAR, LDR and CASA when the source provides them.
-- Does not use conventional FCF/DCF valuation for banks.
-- Non-bank scoring retains growth, profitability, leverage and cash-flow checks.
-- Scores are coverage-aware: unavailable metrics are excluded from the score denominator and shown in `missing_data`; `data_coverage_percent` reports evidence coverage.
-- Adds current-price fallback from historical market data when Yahoo info lacks currentPrice.
-- Adds calculated ROE/ROA only when the required statement values exist.
+# IDX Stock Intelligence API V4
 
 ## Deploy
-Build: `pip install -r requirements.txt`
-Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Build: `pip install -r requirements.txt`
+- Start: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Root directory: repository root (leave blank on Render if `main.py` is at repo root).
 
-## Endpoints
-- `/api/health`
-- `/api/universe`
-- `/api/stock/{code}`
-- `/api/stock/{code}/fundamental`
-- `/api/scan`
-- `/api/short-term`
-- `/api/trend`
-- `/api/long-term`
-- `/api/data-sources`
-- `/docs`
+## V4 changes
+- Optional manual bank-ratio overrides sourced from published bank reports.
+- Each manual override includes source, report period, and source URL in the API response.
+- No sample financial values are pre-filled; missing metrics remain null.
+- `/api/data-quality/{code}` shows which bank ratios are configured.
+- Banking analysis does not use conventional FCF/DCF.
+- Coverage-aware score remains separate from data coverage.
+- No undocumented IDX API scraping is used.
+
+## Manual bank metrics
+Copy `bank_metrics.example.json` to `bank_metrics.json`, then enter values copied from an official bank report.
+Values must be percentages (e.g. 3.2 means 3.2%, not 0.032). Keep missing values as `null`.
+Supported fields: `nim`, `npl_gross`, `npl_net`, `car`, `ldr`, `casa`.
+Set `reporting_period`, `source`, and `source_url` to the exact report used.
+
+Example structure:
+```json
+{
+  "BBCA": {
+    "reporting_period": "2026-Q2",
+    "source": "Official quarterly report",
+    "source_url": "https://...",
+    "metrics": {
+      "nim": 5.4,
+      "npl_gross": 1.8,
+      "npl_net": 0.6,
+      "car": 27.0,
+      "ldr": 80.0,
+      "casa": 82.0
+    }
+  }
+}
+```
+The example numbers above are illustrative only and must not be used as BBCA data.
+
+For Render, upload `bank_metrics.json` to the repository root or configure `BANK_METRICS_FILE` to a valid file path. Changes require a new deploy. The API does not independently verify manually entered figures.
 
 ## Important limitations
-Yahoo Finance/yfinance is not an official IDX data feed and can be delayed, incomplete, or inconsistently labeled. V3 does not scrape undocumented IDX endpoints. Banking ratios such as NIM, NPL, CAR, LDR and CASA are not fabricated or inferred when absent from the data provider; they remain null and reduce data coverage. Confirm all figures using audited company reports and IDX disclosures. The score is a screening aid, not a forecast or investment instruction.
+- Yahoo Finance may omit or mislabel Indonesian bank ratios.
+- IDX disclosure portal is a reference for manual cross-checking, not an integrated live data API.
+- Data can be delayed or incomplete.
+- Scores are educational screening outputs, not forecasts or buy/sell instructions.

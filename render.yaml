@@ -1,17 +1,7 @@
 services:
   - type: web
-    name: idx-stock-intelligence-v3
+    name: idx-stock-intelligence-v2
     runtime: python
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /api/health
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.7
-      - key: CACHE_TTL_SECONDS
-        value: 900
-      - key: HISTORY_PERIOD
-        value: 1y
-      - key: CORS_ORIGINS
-        value: "*"
+    plan: free
