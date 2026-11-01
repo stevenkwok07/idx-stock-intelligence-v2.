@@ -47,3 +47,14 @@ For Render, upload `bank_metrics.json` to the repository root or configure `BANK
 - IDX disclosure portal is a reference for manual cross-checking, not an integrated live data API.
 - Data can be delayed or incomplete.
 - Scores are educational screening outputs, not forecasts or buy/sell instructions.
+
+
+## V5 changes
+- Strict data-quality gate: fundamental coverage below 70% always returns `INSUFFICIENT_DATA`, even if the provisional score is high.
+- Adds a coverage confidence label and explicit classification-gate explanation.
+- Banking score now includes NPL net as a separate criterion and rebalances bank weights to 100.
+- Adds `bank_required_metrics_missing` so all six required bank ratios are explicitly reported.
+- Missing values remain null; this release does not automatically fetch bank ratios from IDX.
+- The score is a rule-based screening aid, not a valuation or a buy/sell instruction.
+
+After deployment, verify `/api/health`, `/api/stock/BBCA/fundamental`, and `/api/data-quality/BBCA`.

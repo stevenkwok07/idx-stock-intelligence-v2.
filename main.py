@@ -55,8 +55,8 @@ def valid_percent(value, low=0, high=100):
 
 app = FastAPI(
     title="IDX Stock Intelligence API",
-    version="4.0.0",
-    description="IDX screener with technical momentum and sector-specific, coverage-aware fundamental analysis.",
+    version="5.0.0",
+    description="IDX screener with technical momentum, sector-specific fundamentals, and a strict data-coverage gate.",
 )
 
 origins_env = os.getenv("CORS_ORIGINS", "*")
@@ -439,15 +439,16 @@ def analyze_fundamental(ticker: str) -> dict:
     criteria = []
     if is_bank:
         criteria = [
-            (revenue_growth, lambda x: x > 5, 10, "Pertumbuhan pendapatan >5% YoY"),
-            (profit_growth, lambda x: x > 5, 10, "Pertumbuhan laba bersih >5% YoY"),
-            (roe, lambda x: x >= 12, 15, "ROE minimal 12%"),
-            (roa, lambda x: x >= 1.5, 10, "ROA minimal 1,5%"),
-            (nim, lambda x: x >= 3.5, 15, "NIM minimal 3,5%"),
-            (npl_gross, lambda x: x <= 3, 15, "NPL gross maksimal 3%"),
-            (car, lambda x: x >=  12, 15, "CAR memenuhi batas evaluasi internal"),
-            (ldr, lambda x: 75 <= x <= 92, 5, "LDR berada pada rentang evaluasi internal"),
-            (casa, lambda x: x >= 50, 5, "CASA minimal 50%"),
+            (revenue_growth, lambda x: x > 5, 8, "Pertumbuhan pendapatan >5% YoY"),
+            (profit_growth, lambda x: x > 5, 8, "Pertumbuhan laba bersih >5% YoY"),
+            (roe, lambda x: x >= 12, 14, "ROE minimal 12%"),
+            (roa, lambda x: x >= 1.5, 9, "ROA minimal 1,5%"),
+            (nim, lambda x: x >= 3.5, 14, "NIM minimal 3,5%"),
+            (npl_gross, lambda x: x <= 3, 12, "NPL gross maksimal 3%"),
+            (npl_net, lambda x: x <= 1.5, 5, "NPL net maksimal 1,5% (ambang internal; verifikasi definisi)"),
+            (car, lambda x: x >= 12, 14, "CAR memenuhi batas evaluasi internal"),
+            (ldr, lambda x: 75 <= x <= 92, 8, "LDR berada pada rentang evaluasi internal"),
+            (casa, lambda x: x >= 50, 8, "CASA minimal 50%"),
         ]
     else:
         criteria = [
@@ -515,15 +516,26 @@ def analyze_fundamental(ticker: str) -> dict:
         dcf_assumptions = {"projection_years": 5, "discount_rate_percent": 12, "terminal_growth_percent": 3,
                            "growth_cap_percent": 8, "warning": "Illustrative only; validate cash flows and assumptions manually."}
 
+    # V5 data-quality gate: scores are provisional until at least 70% of
+    # weighted criteria are populated. A high partial score cannot become a
+    # quality candidate. Missing data is never treated as a pass.
+    if coverage < 70:
+        classification = "INSUFFICIENT_DATA"
+    elif score >= 75 and not risks:
+        classification = "QUALITY_CANDIDATE"
+    elif score >= 55:
+        classification = "REVIEW"
+    else:
+        classification = "WEAK_OR_UNPROVEN"
+
+    confidence = (
+        "HIGHER_COVERAGE" if coverage >= 85 else
+        "MODERATE_COVERAGE" if coverage >= 70 else
+        "LOW_COVERAGE"
+    )
     if is_bank:
-        classification = "INSUFFICIENT_DATA" if coverage < 40 else (
-            "QUALITY_CANDIDATE" if score >= 75 and coverage >= 70 and not risks else (
-                "REVIEW" if score >= 55 else "WEAK_OR_UNPROVEN"))
         moat_proxy = "Not assessed automatically"
     else:
-        classification = "INSUFFICIENT_DATA" if coverage < 40 else (
-            "QUALITY_CANDIDATE" if score >= 75 and coverage >= 70 and not risks else (
-                "REVIEW" if score >= 55 else "WEAK_OR_UNPROVEN"))
         moat_proxy = "Potential profitability strength; not proof of moat" if (roe or 0) >= 15 and (operating_margin or 0) >= 12 else "Insufficient evidence"
 
     return {
@@ -555,13 +567,26 @@ def analyze_fundamental(ticker: str) -> dict:
         "moat_warning": "Moat tidak dapat dipastikan dari rasio otomatis; perlu riset pangsa pasar, switching cost, brand, pricing power, dan daya tahan keuntungan.",
         "score": score, "score_percent": score, "max_score": 100,
         "data_coverage_percent": coverage, "available_weight": available_weight,
-        "classification": classification, "positives": positives,
+        "classification": classification, "confidence_level": confidence,
+        "classification_gate": {
+            "minimum_coverage_percent": 70,
+            "actual_coverage_percent": coverage,
+            "passed": coverage >= 70,
+            "rule": "Coverage below 70% forces INSUFFICIENT_DATA regardless of provisional score."
+        },
+        "positives": positives,
         "risk_flags": risks, "missing_data": missing,
         "financial_periods_available": {
             "revenue": [x[0] for x in revenue_s], "net_income": [x[0] for x in profit_s],
             "operating_cash_flow": [x[0] for x in cfo_s], "free_cash_flow": [x[0] for x in fcf_s],
         },
-        "scoring_method": "Coverage-aware sector-specific rule scoring; missing metrics are excluded from score denominator and reported separately.",
+        "scoring_method": "V5 coverage-aware sector-specific provisional scoring. Missing metrics are excluded from score denominator, but coverage below 70% forces INSUFFICIENT_DATA.",
+        "bank_required_metrics_missing": (
+            [key for key, value in {
+                "nim": nim, "npl_gross": npl_gross, "npl_net": npl_net,
+                "car": car, "ldr": ldr, "casa": casa
+            }.items() if value is None] if is_bank else []
+        ),
         "bank_metric_provenance": metric_sources if is_bank else {},
         "bank_report_period": manual.get("reporting_period") if is_bank else None,
         "bank_report_source_url": manual.get("source_url") if is_bank else None,
@@ -588,7 +613,14 @@ def data_quality(code: str):
     manual = load_manual_bank_metrics(ticker) if is_bank else {}
     metrics = manual.get("metrics", {}) if isinstance(manual.get("metrics", {}), dict) else {}
     expected = ["nim", "npl_gross", "npl_net", "car", "ldr", "casa"] if is_bank else []
-    supplied = [key for key in expected if valid_percent(metrics.get(key), 0, 200) is not None]
+    metric_bounds = {
+        "nim": (0, 100), "npl_gross": (0, 100), "npl_net": (0, 100),
+        "car": (0, 100), "ldr": (0, 200), "casa": (0, 100),
+    }
+    supplied = [
+        key for key in expected
+        if valid_percent(metrics.get(key), *metric_bounds[key]) is not None
+    ]
     return {
         "ticker": ticker,
         "sector_engine": "BANKING" if is_bank else "NON_BANKING",
@@ -604,18 +636,18 @@ def data_quality(code: str):
 @app.get("/")
 def root():
     return {
-        "name": "IDX Stock Intelligence API", "version": "4.0.0", "status": "ok", "docs": "/docs",
+        "name": "IDX Stock Intelligence API", "version": "5.0.0", "status": "ok", "docs": "/docs",
         "endpoints": [
             "/api/health", "/api/universe", "/api/scan", "/api/trend",
             "/api/short-term", "/api/long-term", "/api/stock/BBCA",
-            "/api/stock/BBCA/fundamental", "/api/data-quality/BBCA", "/api/cache/clear",
+            "/api/stock/BBCA/fundamental", "/api/data-quality/BBCA", "/api/data-sources", "/api/cache/clear",
         ],
     }
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "idx-stock-intelligence", "version": "4.0.0"}
+    return {"status": "ok", "service": "idx-stock-intelligence", "version": "5.0.0"}
 
 
 @app.get("/api/universe")
