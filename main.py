@@ -674,7 +674,7 @@ def data_quality(code: str):
 @app.get("/")
 def root():
     return {
-        "name": "IDX Stock Intelligence API", "version": "5.0.0", "status": "ok", "docs": "/docs",
+        "name": "IDX Stock Intelligence API", "version": "5.1.0", "status": "ok", "docs": "/docs",
         "endpoints": [
             "/api/health", "/api/universe", "/api/scan", "/api/trend",
             "/api/short-term", "/api/long-term", "/api/stock/BBCA",
@@ -685,7 +685,7 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "idx-stock-intelligence", "version": "5.0.0"}
+    return {"status": "ok", "service": "idx-stock-intelligence", "version": "5.1.0"}
 
 
 @app.get("/api/universe")
