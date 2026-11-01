@@ -55,7 +55,7 @@ def valid_percent(value, low=0, high=100):
 
 app = FastAPI(
     title="IDX Stock Intelligence API",
-    version="5.0.0",
+    version="5.1.0",
     description="IDX screener with technical momentum, sector-specific fundamentals, and a strict data-coverage gate.",
 )
 
@@ -420,11 +420,13 @@ def analyze_fundamental(ticker: str) -> dict:
             }
 
     operating_margin = _ratio_percent(_first_info(info, ["operatingMargins"]))
-    debt_equity = _first_info(info, ["debtToEquity"])
-    if debt_equity is not None and abs(debt_equity) > 10:
-        debt_equity = debt_equity / 100
-    if debt_equity is None and total_debt is not None and total_equity and total_equity > 0:
-        debt_equity = total_debt / total_equity
+    debt_equity = None
+    if not is_bank:
+        debt_equity = _first_info(info, ["debtToEquity"])
+        if debt_equity is not None and abs(debt_equity) > 10:
+            debt_equity = debt_equity / 100
+        if debt_equity is None and total_debt is not None and total_equity and total_equity > 0:
+            debt_equity = total_debt / total_equity
 
     price_to_book = _first_info(info, ["priceToBook"])
     if price_to_book is None and market_cap is not None and total_equity and total_equity > 0:
@@ -538,6 +540,37 @@ def analyze_fundamental(ticker: str) -> dict:
     else:
         moat_proxy = "Potential profitability strength; not proof of moat" if (roe or 0) >= 15 and (operating_margin or 0) >= 12 else "Insufficient evidence"
 
+    # V5.1 data-quality diagnostics: report statement periods explicitly and
+    # never compare bank leverage using generic corporate debt/equity ratios.
+    income_period = str(latest_income_col.date()) if hasattr(latest_income_col, "date") else (str(latest_income_col) if latest_income_col is not None else None)
+    balance_period = str(latest_balance_col.date()) if hasattr(latest_balance_col, "date") else (str(latest_balance_col) if latest_balance_col is not None else None)
+    period_warnings = []
+    if income_period and balance_period and income_period != balance_period:
+        period_warnings.append(
+            f"Periode laporan laba rugi ({income_period}) berbeda dari neraca ({balance_period}); periksa sebelum membandingkan rasio."
+        )
+
+    bank_warnings = []
+    if is_bank:
+        missing_bank_keys = [key for key, value in {
+            "nim": nim, "npl_gross": npl_gross, "npl_net": npl_net,
+            "car": car, "ldr": ldr, "casa": casa
+        }.items() if value is None]
+        if missing_bank_keys:
+            bank_warnings.append(
+                "Rasio bank berikut belum tersedia: " + ", ".join(missing_bank_keys) +
+                ". Nilai kosong bukan nol dan tidak boleh dianggap memenuhi kriteria."
+            )
+        if metric_sources:
+            if not manual.get("reporting_period"):
+                bank_warnings.append("Input rasio manual tidak memiliki reporting_period.")
+            if not manual.get("source_url"):
+                bank_warnings.append("Input rasio manual tidak memiliki source_url untuk verifikasi.")
+            bank_warnings.append("Rasio bank dari input manual; cocokkan definisi, satuan, dan periode dengan laporan resmi.")
+        bank_warnings.append("Debt/equity generik tidak digunakan untuk menilai bank; gunakan CAR, kualitas aset, dan rasio pendanaan yang relevan.")
+
+    data_quality_warnings = bank_warnings + period_warnings
+
     return {
         "ticker": ticker, "code": ticker.replace(".JK", ""),
         "name": info.get("longName") or info.get("shortName") or ticker.replace(".JK", ""),
@@ -580,7 +613,7 @@ def analyze_fundamental(ticker: str) -> dict:
             "revenue": [x[0] for x in revenue_s], "net_income": [x[0] for x in profit_s],
             "operating_cash_flow": [x[0] for x in cfo_s], "free_cash_flow": [x[0] for x in fcf_s],
         },
-        "scoring_method": "V5 coverage-aware sector-specific provisional scoring. Missing metrics are excluded from score denominator, but coverage below 70% forces INSUFFICIENT_DATA.",
+        "scoring_method": "V5.1 coverage-aware sector-specific provisional scoring. Missing metrics are excluded from score denominator, but coverage below 70% forces INSUFFICIENT_DATA. Generic debt/equity is excluded for banks.",
         "bank_required_metrics_missing": (
             [key for key, value in {
                 "nim": nim, "npl_gross": npl_gross, "npl_net": npl_net,
@@ -591,17 +624,22 @@ def analyze_fundamental(ticker: str) -> dict:
         "bank_report_period": manual.get("reporting_period") if is_bank else None,
         "bank_report_source_url": manual.get("source_url") if is_bank else None,
         "manual_bank_metrics_loaded": bool(metric_sources) if is_bank else False,
-        "data_quality_warnings": (
-            ["Rasio bank dari input manual; cocokkan periode, definisi, dan angka dengan laporan resmi."]
-            if metric_sources else
-            (["Rasio NIM/NPL/CAR/LDR/CASA belum tersedia dari sumber data otomatis. Jangan menafsirkannya sebagai nol."]
-             if is_bank else [])
+        "data_quality_warnings": data_quality_warnings,
+        "statement_periods": {
+            "income_statement": income_period,
+            "balance_sheet": balance_period,
+            "aligned": bool(income_period and balance_period and income_period == balance_period)
+        },
+        "debt_to_equity_note": (
+            "Not applicable as a generic screening metric for banks; use bank-specific capital and asset-quality ratios."
+            if is_bank else
+            "Generic debt/equity ratio; verify balance-sheet definitions and sector comparability."
         ),
         "data_sources": [
             {"name": "Yahoo Finance/yfinance", "type": "market_and_financial_data"},
             {"name": "IDX disclosure portal", "url": IDX_DISCLOSURE_URL, "type": "official_cross_check_reference"},
         ],
-        "data_note": "Yahoo Finance coverage and labels may be incomplete. Bank-specific ratios are only scored when supplied; missing NIM/NPL/CAR/LDR/CASA are not inferred. Verify against audited reports and IDX disclosures.",
+        "data_note": "Yahoo Finance coverage and labels may be incomplete. Bank-specific ratios are only scored when supplied; missing NIM/NPL/CAR/LDR/CASA are not inferred. Statement periods are exposed for alignment checks. Generic debt/equity is not used for banks. Verify against audited reports and IDX disclosures.",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 

@@ -49,7 +49,7 @@ For Render, upload `bank_metrics.json` to the repository root or configure `BANK
 - Scores are educational screening outputs, not forecasts or buy/sell instructions.
 
 
-## V5 changes
+## V5.1 changes
 - Strict data-quality gate: fundamental coverage below 70% always returns `INSUFFICIENT_DATA`, even if the provisional score is high.
 - Adds a coverage confidence label and explicit classification-gate explanation.
 - Banking score now includes NPL net as a separate criterion and rebalances bank weights to 100.
@@ -58,3 +58,11 @@ For Render, upload `bank_metrics.json` to the repository root or configure `BANK
 - The score is a rule-based screening aid, not a valuation or a buy/sell instruction.
 
 After deployment, verify `/api/health`, `/api/stock/BBCA/fundamental`, and `/api/data-quality/BBCA`.
+
+
+## V5.1 changes
+- Adds statement period diagnostics (`statement_periods`) and warns when income statement and balance sheet periods differ.
+- Bank data-quality warnings list every missing bank ratio, including NPL net.
+- Generic debt/equity is excluded for banks and explicitly marked not applicable.
+- Manual bank metric inputs warn when reporting period or source URL is absent.
+- Version: 5.1.0.
