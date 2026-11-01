@@ -34,8 +34,8 @@ IDX_DISCLOSURE_URL = "https://www.idx.co.id/id/perusahaan-tercatat/keterbukaan-i
 
 app = FastAPI(
     title="IDX Stock Intelligence API",
-    version="2.0.0",
-    description="Dual-engine IDX stock screener: technical momentum and fundamental quality/valuation.",
+    version="3.0.0",
+    description="IDX screener with technical momentum and sector-specific, coverage-aware fundamental analysis.",
 )
 
 origins_env = os.getenv("CORS_ORIGINS", "*")
@@ -280,10 +280,38 @@ def fetch_fundamentals(ticker: str) -> dict:
     return cache_get_or_create(f"fundamentals:{ticker}", max(CACHE_TTL_SECONDS, 3600), load)
 
 
+
+BANK_TICKERS = {
+    "BBCA.JK", "BBRI.JK", "BMRI.JK", "BBNI.JK", "BRIS.JK", "BNGA.JK",
+    "BDMN.JK", "NISP.JK", "MEGA.JK", "ARTO.JK", "BBTN.JK", "BTPN.JK",
+    "BTPS.JK", "BACA.JK", "AGRO.JK", "BJBR.JK", "BJTM.JK",
+}
+
+def _first_info(info: dict, keys: list[str]):
+    for key in keys:
+        value = safe_float(info.get(key))
+        if value is not None:
+            return value
+    return None
+
+def _ratio_percent(value):
+    value = safe_float(value)
+    if value is None:
+        return None
+    # Yahoo ratios are usually decimals, while some reported data may already be percent.
+    return value * 100 if abs(value) <= 1.5 else value
+
+def _latest_and_previous(series):
+    return (series[0][1], series[1][1]) if len(series) >= 2 else (
+        series[0][1] if series else None, None
+    )
+
 def analyze_fundamental(ticker: str) -> dict:
     raw = fetch_fundamentals(ticker)
     info, income, cashflow, balance = raw["info"], raw["income"], raw["cashflow"], raw["balance"]
-    revenue_s = _get_series(income, ["Total Revenue", "Operating Revenue"])
+    is_bank = ticker in BANK_TICKERS
+
+    revenue_s = _get_series(income, ["Total Revenue", "Operating Revenue", "Total Non Interest Income"])
     profit_s = _get_series(income, ["Net Income", "Net Income Common Stockholders"])
     cfo_s = _get_series(cashflow, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"])
     capex_s = _get_series(cashflow, ["Capital Expenditure", "Capital Expenditures"])
@@ -291,129 +319,209 @@ def analyze_fundamental(ticker: str) -> dict:
 
     latest_income_col = income.columns[0] if income is not None and not income.empty else None
     latest_balance_col = balance.columns[0] if balance is not None and not balance.empty else None
-    revenue = _statement_value(income, ["Total Revenue", "Operating Revenue"], latest_income_col)
+    previous_balance_col = balance.columns[1] if balance is not None and len(balance.columns) > 1 else None
+
+    revenue = _statement_value(income, ["Total Revenue", "Operating Revenue", "Total Non Interest Income"], latest_income_col)
     net_income = _statement_value(income, ["Net Income", "Net Income Common Stockholders"], latest_income_col)
+    pretax_income = _statement_value(income, ["Pretax Income", "Pretax Income (Loss)", "Income Before Tax"], latest_income_col)
     operating_income = _statement_value(income, ["Operating Income"], latest_income_col)
     total_debt = _statement_value(balance, ["Total Debt"], latest_balance_col)
-    total_equity = _statement_value(balance, ["Stockholders Equity", "Total Equity Gross Minority Interest"], latest_balance_col)
+    total_equity = _statement_value(balance, ["Stockholders Equity", "Total Equity Gross Minority Interest", "Common Stock Equity"], latest_balance_col)
+    previous_equity = _statement_value(balance, ["Stockholders Equity", "Total Equity Gross Minority Interest", "Common Stock Equity"], previous_balance_col)
     total_assets = _statement_value(balance, ["Total Assets"], latest_balance_col)
+    previous_assets = _statement_value(balance, ["Total Assets"], previous_balance_col)
     cash = _statement_value(balance, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"], latest_balance_col)
     cfo = _statement_value(cashflow, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"])
     capex = _statement_value(cashflow, ["Capital Expenditure", "Capital Expenditures"])
     fcf = _statement_value(cashflow, ["Free Cash Flow"])
     if fcf is None and cfo is not None and capex is not None:
-        # Yahoo often reports capex as a negative cash flow.
         fcf = cfo + capex if capex < 0 else cfo - capex
 
-    roe = safe_float(info.get("returnOnEquity"))
-    if roe is not None:
-        roe *= 100
-    operating_margin = safe_float(info.get("operatingMargins"))
-    if operating_margin is not None:
-        operating_margin *= 100
-    debt_equity = safe_float(info.get("debtToEquity"))
-    market_cap = safe_float(info.get("marketCap"))
-    shares = safe_float(info.get("sharesOutstanding"))
-    eps = safe_float(info.get("trailingEps"))
-    book_value = safe_float(info.get("bookValue"))
-    current_price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+    revenue_latest, revenue_previous = _latest_and_previous(revenue_s)
+    profit_latest, profit_previous = _latest_and_previous(profit_s)
+    revenue_growth = ((revenue_latest / revenue_previous) - 1) * 100 if revenue_latest is not None and revenue_previous not in (None, 0) else None
+    profit_growth = ((profit_latest / profit_previous) - 1) * 100 if profit_latest is not None and profit_previous not in (None, 0) else None
 
-    revenue_growth = None
-    if len(revenue_s) >= 2 and revenue_s[1][1] != 0:
-        revenue_growth = (revenue_s[0][1] / revenue_s[1][1] - 1) * 100
-    profit_growth = None
-    if len(profit_s) >= 2 and profit_s[1][1] != 0:
-        profit_growth = (profit_s[0][1] / profit_s[1][1] - 1) * 100
+    shares = _first_info(info, ["sharesOutstanding", "impliedSharesOutstanding"])
+    eps = _first_info(info, ["trailingEps", "forwardEps"])
+    book_value = _first_info(info, ["bookValue"])
+    current_price = _first_info(info, ["currentPrice", "regularMarketPrice"])
+    if current_price is None:
+        try:
+            hist = fetch_history(ticker)
+            current_price = safe_float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+    market_cap = _first_info(info, ["marketCap"])
+    if market_cap is None and current_price is not None and shares is not None:
+        market_cap = current_price * shares
 
-    score, max_score = 0, 100
+    # Prefer reported ratios; derive only ratios whose numerator/denominator are clearly identified.
+    roe = _ratio_percent(_first_info(info, ["returnOnEquity"]))
+    if roe is None and net_income is not None and total_equity and previous_equity:
+        avg_equity = (total_equity + previous_equity) / 2
+        roe = net_income / avg_equity * 100 if avg_equity else None
+
+    roa = _ratio_percent(_first_info(info, ["returnOnAssets"]))
+    if roa is None and pretax_income is not None and total_assets and previous_assets:
+        avg_assets = (total_assets + previous_assets) / 2
+        roa = pretax_income / avg_assets * 100 if avg_assets else None
+
+    nim = _ratio_percent(_first_info(info, ["netInterestMargin", "netInterestMarginPercent", "nim"]))
+    npl_gross = _ratio_percent(_first_info(info, ["nonPerformingLoan", "nonPerformingLoans", "nplGross", "nplGrossPercent"]))
+    npl_net = _ratio_percent(_first_info(info, ["nplNet", "nplNetPercent"]))
+    car = _ratio_percent(_first_info(info, ["capitalAdequacyRatio", "capitalAdequacy", "car"]))
+    ldr = _ratio_percent(_first_info(info, ["loanToDepositRatio", "loanToDeposit", "ldr"]))
+    casa = _ratio_percent(_first_info(info, ["casaRatio", "casa"]))
+
+    operating_margin = _ratio_percent(_first_info(info, ["operatingMargins"]))
+    debt_equity = _first_info(info, ["debtToEquity"])
+    if debt_equity is not None and abs(debt_equity) > 10:
+        debt_equity = debt_equity / 100
+    if debt_equity is None and total_debt is not None and total_equity and total_equity > 0:
+        debt_equity = total_debt / total_equity
+
+    price_to_book = _first_info(info, ["priceToBook"])
+    if price_to_book is None and market_cap is not None and total_equity and total_equity > 0:
+        price_to_book = market_cap / total_equity
+    trailing_pe = _first_info(info, ["trailingPE"])
+    if trailing_pe is None and current_price and eps and eps > 0:
+        trailing_pe = current_price / eps
+
+    # V3 uses a coverage-aware score: missing data is excluded from the denominator,
+    # and a separate coverage percentage tells users how much evidence is available.
     positives, risks, missing = [], [], []
-    criteria = [
-        (revenue_growth is not None and revenue_growth > 5, 12, "Pendapatan tumbuh lebih dari 5% YoY"),
-        (profit_growth is not None and profit_growth > 5, 12, "Laba bersih tumbuh lebih dari 5% YoY"),
-        (roe is not None and roe >= 15, 12, "ROE minimal 15%"),
-        (operating_margin is not None and operating_margin >= 15, 10, "Operating margin minimal 15%"),
-        (debt_equity is not None and debt_equity <= 100, 10, "Debt/equity tidak lebih dari 100%"),
-        (cfo is not None and cfo > 0, 12, "Arus kas operasi positif"),
-        (fcf is not None and fcf > 0, 12, "Free cash flow positif"),
-        (total_equity is not None and total_equity > 0, 8, "Ekuitas positif"),
-        (net_income is not None and net_income > 0, 6, "Laba bersih positif"),
-        (cash is not None and total_debt is not None and cash >= total_debt * 0.2, 6, "Kas material dibandingkan utang"),
-    ]
-    for condition, points, label in criteria:
-        if condition:
-            score += points
-            positives.append(label)
-    if revenue_growth is None: missing.append("Pertumbuhan pendapatan tidak tersedia")
-    if profit_growth is None: missing.append("Pertumbuhan laba tidak tersedia")
-    if roe is None: missing.append("ROE tidak tersedia")
-    if debt_equity is None: missing.append("Debt/equity tidak tersedia")
-    if cfo is None: missing.append("Arus kas operasi tidak tersedia")
-    if fcf is None: missing.append("Free cash flow tidak tersedia")
-    if net_income is not None and net_income < 0: risks.append("Perusahaan mencatat rugi bersih pada periode terbaru")
-    if cfo is not None and cfo < 0: risks.append("Arus kas operasi negatif")
-    if fcf is not None and fcf < 0: risks.append("Free cash flow negatif")
-    if total_debt is not None and total_equity and total_equity > 0 and total_debt / total_equity > 2:
-        risks.append("Utang lebih dari 2x ekuitas")
-    if revenue_growth is not None and revenue_growth < 0: risks.append("Pendapatan mengalami kontraksi")
-    if profit_growth is not None and profit_growth < 0: risks.append("Laba bersih mengalami penurunan")
+    criteria = []
+    if is_bank:
+        criteria = [
+            (revenue_growth, lambda x: x > 5, 10, "Pertumbuhan pendapatan >5% YoY"),
+            (profit_growth, lambda x: x > 5, 10, "Pertumbuhan laba bersih >5% YoY"),
+            (roe, lambda x: x >= 12, 15, "ROE minimal 12%"),
+            (roa, lambda x: x >= 1.5, 10, "ROA minimal 1,5%"),
+            (nim, lambda x: x >= 3.5, 15, "NIM minimal 3,5%"),
+            (npl_gross, lambda x: x <= 3, 15, "NPL gross maksimal 3%"),
+            (car, lambda x: x >=  12, 15, "CAR memenuhi batas evaluasi internal"),
+            (ldr, lambda x: 75 <= x <= 92, 5, "LDR berada pada rentang evaluasi internal"),
+            (casa, lambda x: x >= 50, 5, "CASA minimal 50%"),
+        ]
+    else:
+        criteria = [
+            (revenue_growth, lambda x: x > 5, 12, "Pendapatan tumbuh >5% YoY"),
+            (profit_growth, lambda x: x > 5, 12, "Laba bersih tumbuh >5% YoY"),
+            (roe, lambda x: x >= 15, 12, "ROE minimal 15%"),
+            (operating_margin, lambda x: x >= 15, 10, "Operating margin minimal 15%"),
+            (debt_equity, lambda x: x <= 1, 10, "Debt/equity maksimal 1x"),
+            (cfo, lambda x: x > 0, 12, "Arus kas operasi positif"),
+            (fcf, lambda x: x > 0, 12, "Free cash flow positif"),
+            (total_equity, lambda x: x > 0, 8, "Ekuitas positif"),
+            (net_income, lambda x: x > 0, 6, "Laba bersih positif"),
+            (cash if cash is not None and total_debt is not None else None,
+             lambda x: x >= total_debt * 0.2, 6, "Kas material dibandingkan utang"),
+        ]
 
-    # Conservative illustrative DCF: five-year FCF projection with capped growth,
-    # 12% discount rate and 3% terminal growth. Invalid for negative FCF.
+    available_weight = 0
+    earned_weight = 0
+    for value, test, weight, label in criteria:
+        if value is None:
+            missing.append(label.replace("minimal", "").replace("maksimal", "") + " — data tidak tersedia")
+            continue
+        available_weight += weight
+        if test(value):
+            earned_weight += weight
+            positives.append(label)
+
+    score = round(earned_weight / available_weight * 100) if available_weight else 0
+    total_weight = sum(x[2] for x in criteria)
+    coverage = round(available_weight / total_weight * 100) if total_weight else 0
+
+    if revenue_growth is not None and revenue_growth < 0:
+        risks.append("Pendapatan mengalami kontraksi")
+    if profit_growth is not None and profit_growth < 0:
+        risks.append("Laba bersih mengalami penurunan")
+    if net_income is not None and net_income < 0:
+        risks.append("Perusahaan mencatat rugi bersih")
+    if is_bank:
+        if npl_gross is not None and npl_gross > 5:
+            risks.append("NPL gross di atas 5%; perlu pemeriksaan kualitas kredit")
+        if car is not None and car < 12:
+            risks.append("CAR di bawah ambang evaluasi internal 12%; verifikasi ketentuan dan data terbaru")
+        if ldr is not None and (ldr > 100 or ldr < 60):
+            risks.append("LDR berada di luar rentang pemantauan internal")
+    else:
+        if cfo is not None and cfo < 0:
+            risks.append("Arus kas operasi negatif")
+        if fcf is not None and fcf < 0:
+            risks.append("Free cash flow negatif")
+        if debt_equity is not None and debt_equity > 2:
+            risks.append("Debt/equity lebih dari 2x")
+
+    # Conventional FCF-DCF is deliberately disabled for banks.
     intrinsic_value = None
     margin_of_safety = None
-    dcf_assumptions = {"projection_years": 5, "discount_rate_percent": 12, "terminal_growth_percent": 3}
-    if fcf is not None and fcf > 0 and shares and shares > 0 and market_cap and current_price:
-        growth = max(0.0, min((revenue_growth or 0.0) / 100, 0.10))
-        discount = 0.12
-        terminal = 0.03
+    dcf_assumptions = None
+    if not is_bank and fcf is not None and fcf > 0 and shares and shares > 0 and current_price:
+        growth = max(0.0, min((revenue_growth or 0.0) / 100, 0.08))
+        discount, terminal = 0.12, 0.03
         projected = [fcf * ((1 + growth) ** year) for year in range(1, 6)]
         pv = sum(value / ((1 + discount) ** year) for year, value in enumerate(projected, 1))
         terminal_value = projected[-1] * (1 + terminal) / (discount - terminal)
-        pv_terminal = terminal_value / ((1 + discount) ** 5)
-        equity_value = pv + pv_terminal
-        intrinsic_value = equity_value / shares
+        intrinsic_value = (pv + terminal_value / ((1 + discount) ** 5)) / shares
         margin_of_safety = (intrinsic_value - current_price) / intrinsic_value * 100 if intrinsic_value > 0 else None
+        dcf_assumptions = {"projection_years": 5, "discount_rate_percent": 12, "terminal_growth_percent": 3,
+                           "growth_cap_percent": 8, "warning": "Illustrative only; validate cash flows and assumptions manually."}
 
-    # ROE/operating margin are only moat indicators, never proof of a moat.
-    moat_proxy = "Potential strength: profitability metrics" if (roe or 0) >= 15 and (operating_margin or 0) >= 12 else "Insufficient evidence"
-    if len(missing) >= 3:
-        classification = "INSUFFICIENT_DATA"
-    elif score >= 75 and not risks:
-        classification = "QUALITY_CANDIDATE"
-    elif score >= 55:
-        classification = "REVIEW"
+    if is_bank:
+        classification = "INSUFFICIENT_DATA" if coverage < 40 else (
+            "QUALITY_CANDIDATE" if score >= 75 and coverage >= 70 and not risks else (
+                "REVIEW" if score >= 55 else "WEAK_OR_UNPROVEN"))
+        moat_proxy = "Not assessed automatically"
     else:
-        classification = "WEAK_OR_UNPROVEN"
+        classification = "INSUFFICIENT_DATA" if coverage < 40 else (
+            "QUALITY_CANDIDATE" if score >= 75 and coverage >= 70 and not risks else (
+                "REVIEW" if score >= 55 else "WEAK_OR_UNPROVEN"))
+        moat_proxy = "Potential profitability strength; not proof of moat" if (roe or 0) >= 15 and (operating_margin or 0) >= 12 else "Insufficient evidence"
 
     return {
-        "ticker": ticker, "code": ticker.replace(".JK", ""), "name": info.get("longName") or info.get("shortName") or ticker.replace(".JK", ""),
-        "currency": info.get("currency", "IDR"), "current_price": clean_num(current_price),
-        "market_cap": clean_num(market_cap, 0), "revenue_latest": clean_num(revenue, 0),
-        "net_income_latest": clean_num(net_income, 0), "operating_income_latest": clean_num(operating_income, 0),
-        "revenue_growth_yoy_percent": clean_num(revenue_growth), "net_income_growth_yoy_percent": clean_num(profit_growth),
-        "roe_percent": clean_num(roe), "operating_margin_percent": clean_num(operating_margin),
+        "ticker": ticker, "code": ticker.replace(".JK", ""),
+        "name": info.get("longName") or info.get("shortName") or ticker.replace(".JK", ""),
+        "sector_engine": "BANKING" if is_bank else "NON_BANKING",
+        "currency": info.get("currency", "IDR"),
+        "current_price": clean_num(current_price), "market_cap": clean_num(market_cap, 0),
+        "revenue_latest": clean_num(revenue, 0), "net_income_latest": clean_num(net_income, 0),
+        "operating_income_latest": clean_num(operating_income, 0),
+        "revenue_growth_yoy_percent": clean_num(revenue_growth),
+        "net_income_growth_yoy_percent": clean_num(profit_growth),
+        "roe_percent": clean_num(roe), "roa_percent": clean_num(roa),
+        "nim_percent": clean_num(nim), "npl_gross_percent": clean_num(npl_gross),
+        "npl_net_percent": clean_num(npl_net), "car_percent": clean_num(car),
+        "ldr_percent": clean_num(ldr), "casa_percent": clean_num(casa),
+        "operating_margin_percent": clean_num(operating_margin),
         "debt_to_equity": clean_num(debt_equity), "total_debt": clean_num(total_debt, 0),
         "total_equity": clean_num(total_equity, 0), "cash_and_equivalents": clean_num(cash, 0),
-        "operating_cash_flow": clean_num(cfo, 0), "capital_expenditure": clean_num(capex, 0),
-        "free_cash_flow": clean_num(fcf, 0), "trailing_eps": clean_num(eps),
-        "book_value_per_share": clean_num(book_value),
-        "trailing_pe": clean_num(info.get("trailingPE")), "price_to_book": clean_num(info.get("priceToBook")),
+        "operating_cash_flow": clean_num(cfo, 0),
+        "capital_expenditure": clean_num(capex, 0),
+        "free_cash_flow": clean_num(fcf, 0) if not is_bank else None,
+        "trailing_eps": clean_num(eps), "book_value_per_share": clean_num(book_value),
+        "trailing_pe": clean_num(trailing_pe), "price_to_book": clean_num(price_to_book),
         "intrinsic_value_per_share_estimate": clean_num(intrinsic_value),
         "margin_of_safety_percent": clean_num(margin_of_safety),
-        "dcf_assumptions": dcf_assumptions if intrinsic_value is not None else None,
+        "dcf_assumptions": dcf_assumptions,
         "moat_proxy": moat_proxy,
-        "moat_warning": "Moat tidak dapat dipastikan dari rasio otomatis; perlu riset industri, pangsa pasar, switching cost, brand, dan pricing power.",
-        "score": score, "score_percent": score, "classification": classification,
-        "positives": positives, "risk_flags": risks, "missing_data": missing,
+        "moat_warning": "Moat tidak dapat dipastikan dari rasio otomatis; perlu riset pangsa pasar, switching cost, brand, pricing power, dan daya tahan keuntungan.",
+        "score": score, "score_percent": score, "max_score": 100,
+        "data_coverage_percent": coverage, "available_weight": available_weight,
+        "classification": classification, "positives": positives,
+        "risk_flags": risks, "missing_data": missing,
         "financial_periods_available": {
             "revenue": [x[0] for x in revenue_s], "net_income": [x[0] for x in profit_s],
             "operating_cash_flow": [x[0] for x in cfo_s], "free_cash_flow": [x[0] for x in fcf_s],
         },
+        "scoring_method": "Coverage-aware sector-specific rule scoring; missing metrics are excluded from score denominator and reported separately.",
         "data_sources": [
             {"name": "Yahoo Finance/yfinance", "type": "market_and_financial_data"},
             {"name": "IDX disclosure portal", "url": IDX_DISCLOSURE_URL, "type": "official_cross_check_reference"},
         ],
-        "data_note": "Yahoo Finance coverage and statement labels can be incomplete. Verify every financial figure against the company's audited reports and IDX disclosures.",
+        "data_note": "Yahoo Finance coverage and labels may be incomplete. Bank-specific ratios are only scored when supplied; missing NIM/NPL/CAR/LDR/CASA are not inferred. Verify against audited reports and IDX disclosures.",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -421,7 +529,7 @@ def analyze_fundamental(ticker: str) -> dict:
 @app.get("/")
 def root():
     return {
-        "name": "IDX Stock Intelligence API", "version": "2.0.0", "status": "ok", "docs": "/docs",
+        "name": "IDX Stock Intelligence API", "version": "3.0.0", "status": "ok", "docs": "/docs",
         "endpoints": [
             "/api/health", "/api/universe", "/api/scan", "/api/trend",
             "/api/short-term", "/api/long-term", "/api/stock/BBCA",
@@ -432,7 +540,7 @@ def root():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "idx-stock-intelligence", "version": "2.0.0"}
+    return {"status": "ok", "service": "idx-stock-intelligence", "version": "3.0.0"}
 
 
 @app.get("/api/universe")
@@ -538,4 +646,5 @@ def data_sources():
     return {
         "market_data": {"provider": "Yahoo Finance via yfinance", "limitations": ["May be delayed", "Coverage can change", "Not guaranteed real-time"]},
         "official_cross_check": {"provider": "Indonesia Stock Exchange (IDX)", "url": IDX_DISCLOSURE_URL, "usage": "Manual/official verification reference; this backend does not call an undocumented IDX API."},
+        "fundamental_engines": {"banking": ["ROE", "ROA", "NIM", "NPL", "CAR", "LDR", "CASA"], "non_banking": ["growth", "ROE", "operating_margin", "debt_equity", "CFO", "FCF", "illustrative_DCF"]},
     }
